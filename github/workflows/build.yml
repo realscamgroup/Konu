@@ -1,0 +1,140 @@
+name: Multi-OS Electron Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      webhook:
+        description: 'Webhook URL to send the compiled link to'
+        required: true
+        type: string
+      filename:
+        description: 'Name of the compiled file (product name)'
+        required: false
+        default: 'konu_electron'
+        type: string
+      target_os:
+        description: 'Target Operating System'
+        required: true
+        default: 'windows'
+        type: choice
+        options:
+          - windows
+          - macos
+          - linux
+
+jobs:
+  build:
+    name: Build for ${{ inputs.target_os }}
+    runs-on: ${{ (inputs.target_os == 'windows' && 'windows-latest') || (inputs.target_os == 'macos' && 'macos-latest') || 'ubuntu-latest' }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Run Obfuscation
+        run: node builder/scripts/obfuscate.js ./
+
+      - name: Update package.json Build Settings
+        shell: bash
+        run: |
+          node -e '
+            const fs = require("fs");
+            const pkg = JSON.parse(fs.readFileSync("package.json", "utf8"));
+            const filename = "${{ inputs.filename }}";
+            const targetOs = "${{ inputs.target_os }}";
+            
+            pkg.name = filename.toLowerCase().replace(/[^a-z0-9-_]/g, "");
+            pkg.productName = filename;
+            pkg.main = "index.js";
+            pkg.version = "1.0.0";
+            
+            pkg.build = {
+              appId: "com.konu." + pkg.name,
+              productName: filename,
+              electronVersion: "43.4.1",
+              npmRebuild: false,
+              directories: { output: "dist" },
+              files: ["**/*", "!dist/**", "!node_modules/electron/**", "!node_modules/electron-builder/**"]
+            };
+            
+            if (targetOs === "windows") {
+              pkg.build.win = { target: [{ target: "portable", arch: ["x64"] }] };
+              pkg.build.portable = { artifactName: filename + ".exe", requestExecutionLevel: "user" };
+            } else if (targetOs === "macos") {
+              pkg.build.mac = { target: ["zip"], category: "public.app-category.utilities" };
+            } else if (targetOs === "linux") {
+              pkg.build.linux = { target: ["tar.gz"], category: "Utility" };
+            }
+            
+            fs.writeFileSync("package.json", JSON.stringify(pkg, null, 2));
+          '
+
+      - name: Prune Development Dependencies
+        run: npm prune --production
+
+      - name: Compile Application
+        run: npx electron-builder --${{ (inputs.target_os == 'windows' && 'win') || (inputs.target_os == 'macos' && 'mac') || 'linux' }} --x64
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Package and Upload to GoFile
+        shell: bash
+        run: |
+          TARGET_OS="${{ inputs.target_os }}"
+          FILENAME="${{ inputs.filename }}"
+          
+          # Find output binary file
+          if [ "$TARGET_OS" = "windows" ]; then
+            FILE_PATH=$(find dist -name "*.exe" | head -n 1)
+          elif [ "$TARGET_OS" = "macos" ]; then
+            FILE_PATH=$(find dist -name "*.zip" | head -n 1)
+          else
+            FILE_PATH=$(find dist -name "*.tar.gz" | head -n 1)
+          fi
+          
+          if [ -z "$FILE_PATH" ] || [ ! -f "$FILE_PATH" ]; then
+            echo "Error: Output binary not found."
+            exit 1
+          fi
+          
+          # Format file to zip if not already zip
+          if [[ "$FILE_PATH" != *.zip ]]; then
+            zip -j "$FILENAME.zip" "$FILE_PATH"
+            UPLOAD_FILE="$FILENAME.zip"
+          else
+            cp "$FILE_PATH" "$FILENAME.zip"
+            UPLOAD_FILE="$FILENAME.zip"
+          fi
+          
+          echo "Uploading $UPLOAD_FILE to GoFile..."
+          RESPONSE=$(curl -F "file=@$UPLOAD_FILE" https://upload.gofile.io/uploadfile)
+          echo "Response: $RESPONSE"
+          
+          DOWNLOAD_URL=$(echo $RESPONSE | node -e '
+            const fs = require("fs");
+            const data = JSON.parse(fs.readFileSync(0, "utf-8"));
+            if (data.status === "ok") {
+              console.log(data.data.downloadPage);
+            } else {
+              process.exit(1);
+            }
+          ')
+          
+          if [ -z "$DOWNLOAD_URL" ]; then
+            echo "Upload failed."
+            exit 1
+          fi
+          
+          echo "Download URL: $DOWNLOAD_URL"
+          
+          # Send download page to Discord/Custom webhook
+          curl -H "Content-Type: application/json" -d "{\"content\": \"**Build Success!**\nTarget: $TARGET_OS\nDownload link: $DOWNLOAD_URL\"}" "${{ inputs.webhook }}"
