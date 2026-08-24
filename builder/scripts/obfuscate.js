@@ -6,6 +6,10 @@ function getAllJsFiles(dirPath, arrayOfFiles = []) {
   const files = fs.readdirSync(dirPath);
 
   files.forEach(function (file) {
+    // Ignore node dependencies and tool directories
+    if (file === 'node_modules' || file === '.git' || file === '.github' || file === 'builder' || file === 'build') {
+      return;
+    }
     const fullPath = path.join(dirPath, file);
     if (fs.statSync(fullPath).isDirectory()) {
       arrayOfFiles = getAllJsFiles(fullPath, arrayOfFiles);
